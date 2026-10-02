@@ -4,6 +4,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include "page_fault.h"
 
 /*
  * memcpy inside a BPF program is not a libbpf helper; it resolves to a
@@ -61,6 +62,8 @@
 
 #define MAX_COMM_LEN 16
 #define MAX_ENTRIES 8192
+#define MAX_MMAP_REGIONS 1024
+#define PAGE_SIZE  4096
 
 /* file access modes */
 #define O_ACCMODE   00000003
@@ -142,6 +145,14 @@ struct {
 // Global flag to control detailed logging
 volatile const bool detailed_logging = true;
 volatile const unsigned int sampling_rate = 1;  // Sample 1 out of every N events (1 = capture all)
+/* __u32 (not u32): u32 is a vmlinux.h-only typedef, so bpftool would emit an
+ * undeclared "u32" field in the userspace skeleton struct otherwise. */
+volatile const __u32 target_tgid = 0;  // 0 = trace every process, otherwise only this tgid
+
+static __always_inline bool is_target_pid(u32 tgid)
+{
+    return target_tgid == 0 || tgid == target_tgid;
+}
 
 // enter/exit join: stash read/write-family enter args by TID so sys_exit can attach the bytes the
 // syscall RETURNED. Without this, enter events carry (fd,count,offset) but ret=-1, and the generic
@@ -193,7 +204,7 @@ static __always_inline void update_stats(u32 syscall_nr, u64 size)
     }
 }
 
-static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offset, char filename[256], int open_flags_hex, char  open_flags_str[128], long ret, long error_code)
+static __always_inline void log_event_with_owner(u32 syscall_nr, u32 fd, u64 size, s64 offset, char filename[256], int open_flags_hex, char open_flags_str[128], long ret, long error_code, const struct fault_io_owner *owner)
 {
     struct syscall_event *event;
 
@@ -213,7 +224,7 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offs
         return;
 
     event->timestamp = bpf_ktime_get_ns();
-    event->pid = bpf_get_current_pid_tgid() >> 32;
+    event->pid = owner ? owner->pid_tgid >> 32 : bpf_get_current_pid_tgid() >> 32;
     u64 pid_tgid = bpf_get_current_pid_tgid();
     if (syscall_nr == 9) {   /* mmap */
         if (filename[0] == '\0') {
@@ -242,7 +253,10 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offs
     event->fd = fd;
     event->size = size;
     event->offset = offset;
-    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    if (owner)
+        __builtin_memcpy(event->comm, owner->comm, sizeof(event->comm));
+    else
+        bpf_get_current_comm(&event->comm, sizeof(event->comm));
     __builtin_memcpy(event->filename, filename , sizeof(event->filename));
     event->open_flags_hex = open_flags_hex;
     __builtin_memcpy(event->open_flags_str, open_flags_str, sizeof(event->open_flags_str));
@@ -254,10 +268,18 @@ static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offs
         event->ddir = VREAD;
     else if (syscall_nr == 20)
         event->ddir = VWRITE;
+    else if (syscall_nr == EVENT_NR_FAULT_BIO || syscall_nr == EVENT_NR_FAULT_RQ_COMPLETE)
+        event->ddir = (open_flags_hex & 0xff) == 1 ? WRITE : READ;
     event->ret = ret;
     event->error_code = error_code;
 
     bpf_ringbuf_submit(event, 0);
+}
+
+static __always_inline void log_event(u32 syscall_nr, u32 fd, u64 size, s64 offset, char filename[256], int open_flags_hex, char open_flags_str[128], long ret, long error_code)
+{
+    log_event_with_owner(syscall_nr, fd, size, offset, filename, open_flags_hex,
+                         open_flags_str, ret, error_code, NULL);
 }
 
 // read syscall tracepoint
@@ -649,6 +671,460 @@ int trace_fsync_entry(struct trace_event_raw_sys_enter *ctx)
     update_stats(syscall_nr, 1);
     log_event(syscall_nr, fd, 1, 0, "", 0, "", -1, -1);
 
+    return 0;
+}
+
+/* ====================================================================
+ * LAYER 1 — handle_mm_fault(): file-backed user faults
+ *
+ * Why handle_mm_fault and not filemap_fault:
+ *   - filesystem-agnostic (filemap_fault is the generic path, but
+ *     some filesystems supply their own ->fault)
+ *   - gives the `flags` argument, so FAULT_FLAG_USER can be filtered
+ *   - gives the vma directly, so the file offset comes from the
+ *     kernel's own bookkeeping instead of a userspace region table
+ *
+ * Signature:
+ *   vm_fault_t handle_mm_fault(struct vm_area_struct *vma,
+ *                              unsigned long address,
+ *                              unsigned int flags,
+ *                              struct pt_regs *regs);
+ * ==================================================================== */
+
+/* per-task fault context: key = pid_tgid */
+struct {
+    __uint(type,        BPF_MAP_TYPE_HASH);
+    __uint(max_entries, FAULT_CTX_MAX);
+    __type(key,         u64);
+    __type(value,       struct fault_ctx);
+} fault_ctx_map SEC(".maps");
+
+/* 256-byte filename scratch, per-CPU so it costs no BPF stack */
+struct {
+    __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key,         u32);
+    __type(value,       struct fault_strbuf);
+} fault_strbuf_map SEC(".maps");
+
+static __always_inline struct fault_strbuf *fault_strbuf_get(void)
+{
+    u32 k = 0;
+    return bpf_map_lookup_elem(&fault_strbuf_map, &k);
+}
+
+/*
+ * Resolve the backing filename from vm_file.
+ * Returns 0 on success, -1 if the dentry chain could not be read.
+ */
+static __always_inline int
+fault_read_filename(struct file *vm_file, char *dst, int dst_sz)
+{
+    struct dentry *dentry = BPF_CORE_READ(vm_file, f_path.dentry);
+    if (!dentry)
+        return -1;
+
+    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
+    if (!name)
+        return -1;
+
+    if (bpf_probe_read_kernel_str(dst, dst_sz, name) <= 0)
+        return -1;
+
+    return 0;
+}
+/* borrowed from mm.h: folio_test_large() == folio_test_head() */
+static __always_inline bool folio_test_large_safe(struct folio *folio)
+{
+    unsigned long flags = BPF_CORE_READ(folio, flags.f);
+    return (flags & (1UL << PG_head)) != 0;
+}
+
+/* borrowed from mm.h: folio_large_nr_pages() == folio->_nr_pages
+ */
+static __always_inline __u32 folio_large_nr_pages_safe(struct folio *folio)
+{
+    if (bpf_core_field_exists(folio->_nr_pages)) {
+        __u32 n = BPF_CORE_READ(folio, _nr_pages);
+        if (n > 0 && n <= 512)        /* bound keeps the verifier happy */
+            return n;
+    }
+
+    /* field removed: derive from order */
+    __u32 order = (__u32)(BPF_CORE_READ(folio, _flags_1) & 0xff);
+    if (order > 9)                      /* cap at 2 MB */
+        order = 9;
+    return 1U << order;
+}
+
+/* number of pages covered in a folio , for both single page and large folios */
+static __always_inline __u32 folio_nr_pages_safe(struct folio *folio)
+{
+    if (!folio_test_large_safe(folio))
+        return 1;
+    return folio_large_nr_pages_safe(folio);
+}
+
+
+SEC("fentry/handle_mm_fault")
+int BPF_PROG(trace_handle_mm_fault_enter,
+             struct vm_area_struct *vma,
+             unsigned long address,
+             unsigned int flags,
+             struct pt_regs *regs)
+{
+
+    /* filter faults that originated from userspace.
+     */
+    if (!(flags & FAULT_FLAG_USER))
+        return 0;
+
+    /* vm_file == NULL  =>  anonymous: heap, stack, MAP_ANONYMOUS,
+     * CUDA/GPU buffers.  These never read from a filesystem, so a
+     * major fault on them means swap, which is not workload IO.
+     */
+    struct file *vm_file = BPF_CORE_READ(vma, vm_file);
+    if (!vm_file)
+        return 0;
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 tgid     = (u32)(pid_tgid >> 32);
+    if (!is_target_pid(tgid))
+        return 0;
+
+
+    u64 vm_start = BPF_CORE_READ(vma, vm_start); /* used to de-reference kernel data structure. */
+    u64 vm_pgoff = BPF_CORE_READ(vma, vm_pgoff); /* This is the page aligned offset within a file that is memory mapped;*/
+
+    if (address < vm_start)
+        return 0;
+
+    /* file offset, straight from the kernel's VMA */
+    u64 file_offset = (vm_pgoff << PAGE_SHIFT) + (address - vm_start);
+
+    struct inode *inode = BPF_CORE_READ(vm_file, f_inode);
+    u64 ino = inode ? BPF_CORE_READ(inode, i_ino) : 0;
+    u32 dev = inode ? BPF_CORE_READ(inode, i_sb, s_dev) : 0;
+
+    struct fault_ctx fc = {};
+    fc.address     = address;
+    fc.file_offset = file_offset;
+    fc.ino         = ino;
+    fc.dev         = dev;
+    fc.fault_flags = flags;
+    fc.start_ns    = bpf_ktime_get_ns();
+    fc.vm_start    = vm_start;
+    fc.vm_pgoff    = vm_pgoff;
+    fc.ra_pages    = 0;
+    fc.folios_added = 0;
+    fc.l2_logged   = 0;
+    fc.bio_count   = 0;
+    fc.bio_bytes   = 0;
+    fc.in_fault    = 1;
+
+    bpf_map_update_elem(&fault_ctx_map, &pid_tgid, &fc, BPF_ANY);
+
+    return 0;
+}
+
+SEC("fexit/handle_mm_fault")
+int BPF_PROG(trace_handle_mm_fault_exit,
+             struct vm_area_struct *vma,
+             unsigned long address,
+             unsigned int flags,
+             struct pt_regs *regs,
+             vm_fault_t ret)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc)
+        return 0;
+
+    u32 r = (u32)ret;
+
+    /*
+     * VM_FAULT_RETRY handling.
+     *
+     * On a cold-cache fault the kernel typically drops the mmap lock to
+     * perform IO and returns MAJOR|RETRY on the first pass; the retried
+     * call then finds the page resident and returns a plain minor.
+     * Checking MAJOR on every exit therefore yields exactly one record
+     * per fault, matching how the kernel's own ru_majflt is accounted.
+     *
+     * The entry probe re-populates the context on the retry, so the
+     * unconditional delete below is safe.
+     */
+    int is_major = (r & VM_FAULT_MAJOR) != 0;
+    int is_error = (r & VM_FAULT_ERROR) != 0;
+
+    if (is_major && !is_error) {
+        struct fault_strbuf *sb = fault_strbuf_get();
+        char *fname = sb ? sb->buf : NULL;
+        if (fname) {
+            __builtin_memset(fname, 0, sizeof(sb->buf));
+            struct file *vm_file = BPF_CORE_READ(vma, vm_file);
+            if (vm_file)
+                fault_read_filename(vm_file, fname, sizeof(sb->buf));
+        }
+
+        u64 latency_ns = bpf_ktime_get_ns() - fc->start_ns;
+
+        update_stats(EVENT_NR_PAGE_FAULT_MAJOR, PAGE_SIZE);
+
+        log_event(EVENT_NR_PAGE_FAULT_MAJOR,
+                  -1,                        /* fd: none for a fault     */
+                  PAGE_SIZE,                 /* size: one page           */
+                  fc->file_offset,           /* offset: file byte offset */
+                  fname ? fname : "",        /* backing file             */
+                  (int)r,                    /* vm_fault_t return value  */
+                  "",                        /* flags string unused      */
+                  (long)latency_ns,          /* ret: fault latency       */
+                  fc->ra_pages);             /* errno slot: reserved     */
+    }
+
+    bpf_map_delete_elem(&fault_ctx_map, &pid_tgid);
+    return 0;
+}
+
+/* ====================================================================
+ * LAYER 2 — filesystem readahead / folio read
+ * ext4_readahead()  gives the window size via readahead_control
+ * ext4_read_folio() covers the single-folio path when RA does not fire
+ *
+ * Both run in the faulting task's context when driven synchronously by
+ * a fault, so the pid_tgid lookup into fault_ctx_map works directly.
+ * ==================================================================== */
+
+/* ── ext4 ─────────────────────────────────────────────────────────── */
+
+SEC("fentry/ext4_readahead")
+int BPF_PROG(trace_ext4_readahead, struct readahead_control *rac)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc || !fc->in_fault)
+        return 0;                 /* readahead outside a tracked fault */
+
+    if (fc->l2_logged)
+        return 0;
+    u32 nr_pages = BPF_CORE_READ(rac, _nr_pages); /* number of pages read ahead done */
+    u64 index    = BPF_CORE_READ(rac, _index); /* page index of the first page that is present in the readahead window. */
+
+    fc->ra_pages = nr_pages;
+    fc->l2_logged = 1;
+
+    update_stats(EVENT_NR_FAULT_READAHEAD, nr_pages * PAGE_SIZE);
+
+    log_event(EVENT_NR_FAULT_READAHEAD,
+              -1,
+              (long)(nr_pages * PAGE_SIZE),
+              index << PAGE_SHIFT,
+              "",
+              (int)nr_pages,
+              "",
+              (long)fc->file_offset,
+              0);
+
+    return 0;
+}
+
+SEC("fentry/ext4_read_folio")
+int BPF_PROG(trace_ext4_read_folio, struct file *file, struct folio *folio)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc || !fc->in_fault)
+        return 0;
+    if (fc->l2_logged)
+        return 0;
+    /* ext4_readahead already accounted this fault's fetch; both
+     * callbacks can fire within one fault and would double-count */
+    if (fc->ra_pages != 0)
+        return 0;
+
+    __u32 nr_pages = folio_nr_pages_safe(folio);
+    __u32 bytes    = nr_pages * PAGE_SIZE_BPF;
+
+    /* folio->index is the page offset of this folio within the file */
+    __u64 index = BPF_CORE_READ(folio, index);
+
+    fc->ra_pages = nr_pages;
+    fc->l2_logged = 1;
+
+    update_stats(EVENT_NR_FAULT_READAHEAD, bytes);
+
+    /* same record shape as the readahead path, so both appear
+     * identically in the JSON and can be summed together        */
+    log_event(EVENT_NR_FAULT_READAHEAD,
+              -1,
+              (long)bytes,              /* bytes this fault fetched  */
+              index << PAGE_SHIFT,      /* file byte offset of folio */
+              "",
+              (int)nr_pages,            /* pages, for symmetry       */
+              "",
+              (long)fc->file_offset,    /* join key back to L1       */
+              0);
+    return 0;
+}
+
+/* ── xfs ──────────────────────────────────────────────────────────── *
+ *
+ * Attach only if the target files live on XFS. libbpf reports a
+ * missing-symbol error at load for whichever filesystem is absent, so
+ * this program is disabled via bpf_program__set_autoload() by the
+ * loader unless xfs is the detected backing filesystem.
+ */
+SEC("fentry/xfs_vm_readahead")
+int BPF_PROG(trace_xfs_readahead, struct readahead_control *rac)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc || !fc->in_fault)
+        return 0;
+
+    u32 nr_pages = BPF_CORE_READ(rac, _nr_pages);
+    u64 index    = BPF_CORE_READ(rac, _index);
+    fc->ra_pages = nr_pages;
+
+    update_stats(EVENT_NR_FAULT_READAHEAD, nr_pages * PAGE_SIZE);
+    log_event(EVENT_NR_FAULT_READAHEAD, -1,
+              (long)(nr_pages * PAGE_SIZE),
+              index << PAGE_SHIFT, "", (int)nr_pages, "",
+              (long)fc->file_offset, 0); /*offset here is logged into fault_ctx during handle_mm_fault probe */
+    return 0;
+}
+
+/* ── filesystem-agnostic fallback ─────────────────────────────────── *
+ *
+ * mm/filemap.c: filemap_add_folio() is called once per folio actually
+ * inserted into the page cache, regardless of filesystem. This is the
+ * single best "real pages fetched" signal if per-fs instrumentation is
+ * not practical.
+ */
+SEC("fentry/filemap_add_folio")
+int BPF_PROG(trace_filemap_add_folio,
+             struct address_space *mapping, struct folio *folio,
+             unsigned long index, unsigned int gfp)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc || !fc->in_fault)
+        return 0;
+
+    /* confirm this folio belongs to the faulting file */
+    struct inode *host = BPF_CORE_READ(mapping, host);
+    if (!host)
+        return 0;
+    u64 ino = BPF_CORE_READ(host, i_ino);
+    if (ino != fc->ino)
+        return 0;                 /* different file - not our fault's IO */
+
+    fc->folios_added += 1;
+    return 0;
+}
+
+/* ====================================================================
+ * LAYER 3 — fault BIO submission and request completion
+ *
+ * a major fault blocks the faulting task until its IO completes, so any bio
+ * that task submits between handle_mm_fault entry and exit is causally
+ * that fault's IO, and L1 already recorded which file and offset the
+ * fault was for.
+ * Request attribution requires issue in the active faulting task.
+ * Plug flushes and delayed dispatch in other contexts are not attributed.
+ * ==================================================================== */
+struct {
+    __uint(type,        BPF_MAP_TYPE_HASH);
+    __uint(max_entries, FAULT_CTX_MAX);
+    __type(key,         __u64);
+    __type(value,       struct fault_request_ctx);
+} fault_request_map SEC(".maps");
+
+SEC("fentry/submit_bio")
+int BPF_PROG(trace_submit_bio, struct bio *bio)
+{
+    if (!bio)
+        return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc || !fc->in_fault)
+        return 0;
+
+    __u64 sector = BPF_CORE_READ(bio, bi_iter.bi_sector);
+    __u32 bytes  = BPF_CORE_READ(bio, bi_iter.bi_size);
+    __u32 opf    = BPF_CORE_READ(bio, bi_opf);
+    if (bytes == 0)
+        return 0;
+
+    __u64 fault_off = fc->file_offset;
+    fc->bio_count += 1;
+    fc->bio_bytes += bytes;
+
+    update_stats(EVENT_NR_FAULT_BIO, bytes);
+
+    log_event(EVENT_NR_FAULT_BIO,
+              -1,
+              (long)bytes,
+              sector << 9,
+              "",
+              (int)opf,
+              "",
+              (long)fault_off,
+              1);
+    return 0;
+}
+
+SEC("tp_btf/block_rq_issue")
+int BPF_PROG(trace_block_rq_issue, struct request *rq)
+{
+    if (!rq)
+        return 0;
+
+    __u64 request_key = (__u64)rq;
+    if (bpf_map_lookup_elem(&fault_request_map, &request_key))
+        return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    struct fault_ctx *fc = bpf_map_lookup_elem(&fault_ctx_map, &pid_tgid);
+    if (!fc || !fc->in_fault)
+        return 0;
+
+    struct fault_request_ctx request = {};
+    request.total_bytes = BPF_CORE_READ(rq, __data_len);
+    if (!request.total_bytes)
+        return 0;
+    request.owner.pid_tgid = pid_tgid;
+    bpf_get_current_comm(request.owner.comm, sizeof(request.owner.comm));
+    request.issue_ns = bpf_ktime_get_ns();
+    request.file_offset = fc->file_offset;
+    request.sector = BPF_CORE_READ(rq, __sector);
+    request.opf = BPF_CORE_READ(rq, cmd_flags); /* op and common flags */
+    bpf_map_update_elem(&fault_request_map, &request_key, &request, BPF_NOEXIST);
+    return 0;
+}
+
+SEC("tp_btf/block_rq_complete")
+int BPF_PROG(trace_block_rq_complete, struct request *rq,
+             blk_status_t error, unsigned int nr_bytes)
+{
+    __u64 request_key = (__u64)rq;
+    struct fault_request_ctx *request = bpf_map_lookup_elem(&fault_request_map, &request_key);
+    if (!request)
+        return 0;
+
+    if (!fault_request_account_completion(request, nr_bytes, error))
+        return 0;
+
+    __u64 latency_ns = bpf_ktime_get_ns() - request->issue_ns;
+    update_stats(EVENT_NR_FAULT_RQ_COMPLETE, request->completed_bytes);
+
+    log_event_with_owner(EVENT_NR_FAULT_RQ_COMPLETE, -1,
+                         request->completed_bytes, request->sector << 9,
+                         "", (int)request->opf, "", (long)latency_ns,
+                         request->status, &request->owner);
+
+    bpf_map_delete_elem(&fault_request_map, &request_key);
     return 0;
 }
 

@@ -73,7 +73,7 @@ else
 	fi
 endif
 
-$(BPF_OBJ): syscall_monitor.bpf.c vmlinux.h
+$(BPF_OBJ): syscall_monitor.bpf.c page_fault.h vmlinux.h
 	$(CLANG) $(BPF_CFLAGS) $(INCLUDES) -c syscall_monitor.bpf.c -o $@
 
 $(SKEL): $(BPF_OBJ)

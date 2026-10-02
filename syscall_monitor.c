@@ -102,6 +102,10 @@ static const char* get_syscall_name(uint32_t nr) {
 	case 20: return "writev";
 	case 74: return "fsync";
         case 257: return "openat";
+        case 1025: return "EVENT_NR_PAGE_FAULT_MAJOR";
+        case 1026: return "EVENT_NR_FAULT_READAHEAD";
+        case 1027: return "EVENT_NR_FAULT_BIO";
+        case 1028: return "EVENT_NR_FAULT_RQ_COMPLETE";
         default: {
             static char buf[32];
             snprintf(buf, sizeof(buf), "syscall_%u", nr);
@@ -763,7 +767,11 @@ int main(int argc, char **argv) {
     
     // Set detailed logging flag
     skel->rodata->detailed_logging = detailed_logging;
-    
+
+    // xfs_vm_readahead only exists on kernels where XFS is built in/loaded;
+    // disabled by default since the target workloads here run on ext4.
+    bpf_program__set_autoload(skel->progs.trace_xfs_readahead, false);
+
     // Load and verify BPF application
     err = syscall_monitor_bpf__load(skel);
     if (err) {
