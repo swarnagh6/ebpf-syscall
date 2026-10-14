@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -968,7 +969,7 @@ long dispatch_one(const syscall_opt *opt, struct mmap_map *m)
 
     int replayed_fd = resolve_fd(pidmap, opt);
     if (replayed_fd < 0 && opt->syscall_nr != 2 && opt->syscall_nr != 257 && opt->syscall_nr != 11
-        && opt->syscall_nr != 9) {
+        && opt->syscall_nr != 9 && opt->syscall_nr != 1026) {
 	fprintf(stderr,
         "[replayer] SKIP-FDMAP ts=%lu pid=%u %-12s fd=%d\n",
         (unsigned long)opt->timestamp_ns,
@@ -1150,6 +1151,46 @@ long dispatch_one(const syscall_opt *opt, struct mmap_map *m)
 		        ret = fsync(replayed_fd);
 	                }
 	        break;
+    case 1026: {
+            if (opt->offset < 0 || opt->size <= 0 ||
+                (uint64_t)opt->size > SIZE_MAX ||
+                opt->size > INT64_MAX - opt->offset) {
+                errno = EINVAL;
+                return -1;
+            }
+            int range_fd = replayed_fd;
+            bool opened_file = false;
+            if (range_fd < 0) {
+                if (opt->filename[0] == '\0') {
+                    fprintf(stderr,
+                        "[replayer] readahead: pid=%d fd=%d has no replay mapping or filename\n",
+                        opt->pid, opt->fd);
+                    return -2;
+                }
+                range_fd = open(opt->filename, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+                if (range_fd < 0)
+                    return -1;
+                opened_file = true;
+                struct stat metadata;
+                if (fstat(range_fd, &metadata) < 0) {
+                    int saved_errno = errno;
+                    close(range_fd);
+                    errno = saved_errno;
+                    return -1;
+                }
+                if (!S_ISREG(metadata.st_mode)) {
+                    close(range_fd);
+                    errno = EINVAL;
+                    return -1;
+                }
+            }
+            ret = readahead(range_fd, (off64_t)opt->offset, (size_t)opt->size);
+            int saved_errno = errno;
+            if (opened_file)
+                close(range_fd);
+            errno = saved_errno;
+            break;
+    }
         case 257: /** openat  */
 		{ /* openat */
                 int dirfd;
