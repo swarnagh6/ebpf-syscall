@@ -566,6 +566,23 @@ python3 filter_syscall_log.py syscall_events_fixed.json final_replay.json
 sudo ./syscall_replayer --paced
 ```
 
+#### Cold page cache for readahead replay
+
+A replayed readahead record (`EVENT_NR_FAULT_READAHEAD`) calls
+`readahead(2)`, which only reads pages that are not already cached. When
+the trace contains readahead records, the replayer first evicts every
+regular file the trace opens or reads ahead from, so the replay issues
+the device IO the capture saw instead of hitting a warm cache. For each
+file it runs `fsync()` then `posix_fadvise(POSIX_FADV_DONTNEED)`, then
+verifies with `mincore()` and retries if pages raced back.
+
+Pages mapped or `mlock()`ed by another live process cannot be evicted;
+they are reported as `[cold-cache] WARM ...` and the replay proceeds.
+Stop the process that maps the file and rerun for an accurate replay.
+
+- `--cold-cache` eviction targets the cached file-data pages of the fd.
+- `--no-cold-cache` keeps the page cache as-is.
+
 The replayer will:
 - Parse each JSON entry from the syscall log
 - Display parsed syscall information

@@ -1664,6 +1664,240 @@ void *dispatcher_thread(void *arg)
             (unsigned long)ctx->syscalls_replayed_failed);
     return NULL;
 }
+
+#define COLD_CACHE_RETRIES  3
+#define MINCORE_WINDOW      (1ULL << 30)   /* bound the mincore vector to 1GB */
+
+struct cold_file_set {
+	char   **paths;
+	size_t   count;
+	size_t   cap;
+};
+
+static int cold_file_set_add(struct cold_file_set *s, const char *path)
+{
+	for (size_t i = 0; i < s->count; i++)
+		if (strcmp(s->paths[i], path) == 0)
+			return 0;
+	if (s->count == s->cap) {
+		size_t cap = s->cap ? s->cap * 2 : 64;
+		char **p = realloc(s->paths, cap * sizeof(*p));
+		if (!p)
+			return -1;
+		s->paths = p;
+		s->cap = cap;
+	}
+	s->paths[s->count] = strdup(path);
+	if (!s->paths[s->count])
+		return -1;
+	s->count++;
+	return 0;
+}
+
+static void cold_file_set_free(struct cold_file_set *s)
+{
+	for (size_t i = 0; i < s->count; i++)
+		free(s->paths[i]);
+	free(s->paths);
+	memset(s, 0, sizeof(*s));
+}
+
+/* Only paths the replay itself resolves without an fd_map: absolute,
+ * or relative to the cwd.  Pseudo-filesystems have no page cache. */
+static bool cold_cache_candidate(const syscall_opt *opt)
+{
+	if (opt->filename[0] == '\0')
+		return false;
+	if (opt->syscall_nr == 257 && opt->filename[0] != '/' &&
+	    opt->fd != AT_FDCWD)
+		return false;
+	if (opt->syscall_nr != 2 && opt->syscall_nr != 257 &&
+	    opt->syscall_nr != 1026)
+		return false;
+	return strncmp(opt->filename, "/proc/", 6) != 0 &&
+	       strncmp(opt->filename, "/sys/", 5) != 0 &&
+	       strncmp(opt->filename, "/dev/", 5) != 0;
+}
+
+/* Collect candidate files with the same brace-balanced object framing
+ * the main replay loop uses.  Returns the number of readahead records
+ * seen, or -1 on allocation failure. */
+static long cold_cache_scan(FILE *fp, struct cold_file_set *files)
+{
+	char line[LINE_BUF];
+	char *buf = calloc(1, JSON_BUFFER_SIZE);
+	syscall_opt *opt = calloc(1, sizeof(*opt));
+	size_t used = 0;
+	int depth = 0;
+	long readaheads = 0;
+
+	if (!buf || !opt) {
+		free(buf);
+		free(opt);
+		return -1;
+	}
+	while (fgets(line, sizeof(line), fp)) {
+		size_t n = strlen(line);
+		bool started = used > 0;
+
+		for (size_t i = 0; i < n; i++) {
+			if (line[i] == '{') {
+				depth++;
+				started = true;
+			} else if (line[i] == '}') {
+				depth--;
+			}
+		}
+		if (!started)
+			continue;
+		if (used + n >= JSON_BUFFER_SIZE - 1) {
+			used = 0;
+			depth = 0;
+			continue;
+		}
+		memcpy(buf + used, line, n);
+		used += n;
+		buf[used] = '\0';
+		if (depth != 0)
+			continue;
+
+		/* Read only the fields this pass needs; malformed records
+		 * are reported once, by the main pass. */
+		cJSON *json = cJSON_Parse(buf);
+		cJSON *nr = cJSON_GetObjectItemCaseSensitive(json, "syscall_nr");
+		cJSON *fdn = cJSON_GetObjectItemCaseSensitive(json, "fd");
+		cJSON *fn = cJSON_GetObjectItemCaseSensitive(json, "filename");
+		bool ok = cJSON_IsNumber(nr) && cJSON_IsNumber(fdn);
+		if (ok) {
+			opt->syscall_nr = (int32_t)nr->valuedouble;
+			/* same u32 reinterpretation as REQUIRE_INT */
+			opt->fd = (int32_t)(uint32_t)(int64_t)fdn->valuedouble;
+			opt->filename[0] = '\0';
+			if (cJSON_IsString(fn) && fn->valuestring) {
+				strncpy(opt->filename, fn->valuestring,
+				        MAX_FILENAME - 1);
+				opt->filename[MAX_FILENAME - 1] = '\0';
+			}
+		}
+		cJSON_Delete(json);
+
+		if (ok) {
+			if (opt->syscall_nr == 1026)
+				readaheads++;
+			if (cold_cache_candidate(opt) &&
+			    cold_file_set_add(files, opt->filename) < 0) {
+				readaheads = -1;
+				break;
+			}
+		}
+		used = 0;
+	}
+	free(buf);
+	free(opt);
+	rewind(fp);
+	return readaheads;
+}
+
+/* Count pages of fd still resident in the page cache, or -1. */
+static long long resident_pages(int fd, off_t size)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	long long resident = 0;
+
+	for (off_t off = 0; off < size; off += MINCORE_WINDOW) {
+		size_t len = (size_t)(size - off < (off_t)MINCORE_WINDOW ?
+		                      size - off : (off_t)MINCORE_WINDOW);
+		size_t pages = (len + page - 1) / page;
+		unsigned char *vec = malloc(pages);
+		if (!vec)
+			return -1;
+		void *addr = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, off);
+		if (addr == MAP_FAILED) {
+			free(vec);
+			return -1;
+		}
+		int rc = mincore(addr, len, vec);
+		munmap(addr, len);
+		if (rc < 0) {
+			free(vec);
+			return -1;
+		}
+		for (size_t i = 0; i < pages; i++)
+			resident += vec[i] & 1;
+		free(vec);
+	}
+	return resident;
+}
+
+/* Flush and evict one file.  Returns pages still resident (0 = cold),
+ * or -1 if the file could not be processed. */
+static long long evict_file(const char *path)
+{
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+	if (fd < 0) {
+		/* created later in the trace, or already removed */
+		if (errno != ENOENT)
+			fprintf(stderr, "[cold-cache] open '%s': %s\n",
+			        path, strerror(errno));
+		return -1;
+	}
+	struct stat st;
+	if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+		close(fd);
+		return -1;
+	}
+	if (st.st_size == 0) {
+		close(fd);
+		return 0;
+	}
+
+	long long left = -1;
+	for (int attempt = 0; attempt < COLD_CACHE_RETRIES; attempt++) {
+		/* dirty pages first, POSIX_FADV_DONTNEED- attempts to free cached pages */
+		if (fsync(fd) < 0 && errno != EINVAL)
+			fprintf(stderr, "[cold-cache] fsync '%s': %s\n",
+			        path, strerror(errno));
+		int err = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+		if (err) {
+			fprintf(stderr, "[cold-cache] fadvise '%s': %s\n",
+			        path, strerror(err));
+			break;
+		}
+		left = resident_pages(fd, st.st_size);
+		if (left <= 0)
+			break;
+	}
+	close(fd);
+	return left;
+}
+
+/* Returns the number of files that are not fully cold. */
+static int cold_cache_evict(const struct cold_file_set *files)
+{
+	long page_kib = sysconf(_SC_PAGESIZE) / 1024;
+	size_t evicted = 0, skipped = 0;
+	int warm = 0;
+
+	for (size_t i = 0; i < files->count; i++) {
+		long long left = evict_file(files->paths[i]);
+		if (left < 0) {
+			skipped++;
+		} else if (left == 0) {
+			evicted++;
+		} else {
+			warm++;
+			fprintf(stderr,
+			        "[cold-cache] WARM '%s': %lld pages (%lld KiB) still "
+			        "resident - mapped or locked by another process?\n",
+			        files->paths[i], left, left * page_kib);
+		}
+	}
+	fprintf(stderr,
+	        "[cold-cache] files=%zu cold=%zu warm=%d skipped=%zu\n",
+	        files->count, evicted, warm, skipped);
+	return warm;
+}
+
 /* main */
 
 int main(int argc, char *argv[])
@@ -1672,6 +1906,7 @@ int main(int argc, char *argv[])
 	const char *json_file = "final_replay.json";
 	int paced = 0;
 	int serial = 0;   /* default: thread-aware (one worker per captured pid) */
+	int cold_cache = -1;   /* -1: auto, on when the trace has readahead */
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--paced") == 0) {
@@ -1680,6 +1915,10 @@ int main(int argc, char *argv[])
 			serial = 1;          /* legacy single-thread mode for A/B */
 		} else if (strcmp(argv[i], "--per-process") == 0) {
 			serial = 0;          /* explicit; this is the default     */
+		} else if (strcmp(argv[i], "--cold-cache") == 0) {
+			cold_cache = 1;
+		} else if (strcmp(argv[i], "--no-cold-cache") == 0) {
+			cold_cache = 0;
 		} else if (argv[i][0] != '-') {
 			json_file = argv[i];
 		}
@@ -1691,9 +1930,10 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Error opening file '%s'\n", json_file);
 		return -1;
 	}
-	printf("[main] Starting syscall replayer -file=%s paced=%s mode=%s\n",
+	printf("[main] Starting syscall replayer -file=%s paced=%s mode=%s cold-cache=%s\n",
 	       json_file, paced ? "yes" : "no",
-	       serial ? "serial(legacy)" : "per-process(thread-aware)");
+	       serial ? "serial(legacy)" : "per-process(thread-aware)",
+	       cold_cache < 0 ? "auto" : cold_cache ? "yes" : "no");
 
 	char line[LINE_BUF];
 	char *json_buffer = calloc(1, JSON_BUFFER_SIZE);
@@ -1725,6 +1965,25 @@ int main(int argc, char *argv[])
 
 	fd_map_init(fdmap);
 	mmap_map_init(mmap);
+
+	if (cold_cache != 0) {
+		struct cold_file_set files = {0};
+		long readaheads = cold_cache_scan(fp, &files);
+
+		if (readaheads < 0) {
+			fprintf(stderr, "[cold-cache] scan failed: out of memory\n");
+		} else if (cold_cache == 1 || readaheads > 0) {
+			fprintf(stderr,
+			        "[cold-cache] %ld readahead records, evicting %zu files\n",
+			        readaheads, files.count);
+			if (cold_cache_evict(&files) > 0)
+				fprintf(stderr,
+				        "[cold-cache] warning: replayed readahead will "
+				        "under-report device IO for warm files; stop "
+				        "the process mapping them and rerun\n");
+		}
+		cold_file_set_free(&files);
+	}
 
 	/* ------------------------------------------------------------------ *
 	 * Pre-pass: find the global minimum timestamp across all records.
